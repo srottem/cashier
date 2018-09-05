@@ -53,12 +53,24 @@ class CashierTest extends PHPUnit_Framework_TestCase
             $table->timestamp('ends_at')->nullable();
             $table->timestamps();
         });
+
+        $this->schema()->create('subscription_items', function ($table) {
+            $table->increments('id');
+            $table->integer('subscription_id');
+            $table->string('stripe_id');
+            $table->string('stripe_plan');
+            $table->integer('quantity');
+            $table->timestamps();
+        });
+
+        \Stripe\Stripe::setApiKey(env('STRIPE_SECRET'));
     }
 
     public function tearDown()
     {
         $this->schema()->drop('users');
         $this->schema()->drop('subscriptions');
+        $this->schema()->drop('subscription_items');
     }
 
     /**
@@ -142,6 +154,58 @@ class CashierTest extends PHPUnit_Framework_TestCase
         $this->assertFalse($invoice->hasStartingBalance());
         $this->assertNull($invoice->coupon());
         $this->assertInstanceOf(Carbon::class, $invoice->date());
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
+    }
+
+    public function testMultiSubscriptionsCanBeCreated()
+    {
+        $user = User::create([
+            'email' => 'taylor@laravel.com',
+            'name' => 'Taylor Otwell',
+        ]);
+
+        // Create MultiSubscription
+        $multisubscription = $user
+            ->newMultisubscription()
+            ->addPlan('monthly-10-1')
+            ->addPlan('monthly-10-2')
+            ->create($this->getTestToken());
+
+        $this->assertEquals(1, count($user->subscriptions));
+        $this->assertNotNull($user->subscription('default')->stripe_id);
+
+        $this->assertTrue($user->subscribed('default'));
+
+        $this->assertTrue($user->onPlan('monthly-10-1'));
+        $this->assertTrue($user->onPlan('monthly-10-2'));
+        $this->assertFalse($user->onPlan('monthly-10-3'));
+
+        $this->assertTrue($user->subscribedToPlan('monthly-10-1'));
+        $this->assertFalse($user->subscribedToPlan('monthly-10-1', 'something'));
+        $this->assertTrue($user->subscribedToPlan('monthly-10-2'));
+        $this->assertFalse($user->subscribedToPlan('monthly-10-3'));
+
+        $this->assertTrue($user->subscribed('default', 'monthly-10-1'));
+        $this->assertTrue($user->subscribed('default', 'monthly-10-2'));
+        $this->assertFalse($user->subscribed('default', 'monthly-10-3'));
+        $this->assertTrue($user->subscription('default')->active());
+        $this->assertFalse($user->subscription('default')->cancelled());
+
+        $subscription = $user->subscription('default');
+
+        // Invoice Tests
+        $invoice = $user->invoices()[0];
+
+        $this->assertEquals('$20.00', $invoice->total());
+        $this->assertFalse($invoice->hasDiscount());
+        $this->assertFalse($invoice->hasStartingBalance());
+        $this->assertNull($invoice->coupon());
+        $this->assertInstanceOf(Carbon::class, $invoice->date());
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
     }
 
     public function test_creating_subscription_with_coupons()
@@ -173,6 +237,9 @@ class CashierTest extends PHPUnit_Framework_TestCase
         $this->assertEquals('$5.00', $invoice->total());
         $this->assertEquals('$5.00', $invoice->amountOff());
         $this->assertFalse($invoice->discountIsPercentage());
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
     }
 
     public function test_creating_subscription_with_an_anchored_billing_cycle()
@@ -210,6 +277,42 @@ class CashierTest extends PHPUnit_Framework_TestCase
             (new \DateTime('first day of next month'))->format('Y-m-d'),
             date('Y-m-d', $invoicePeriod->end)
         );
+    }
+
+    public function testMultiSubscriptionsWithCoupons()
+    {
+        $user = User::create([
+            'email' => 'taylor@laravel.com',
+            'name' => 'Taylor Otwell',
+        ]);
+
+        // Create MultiSubscription
+        $multisubscription = $user
+            ->newMultisubscription()
+            ->addPlan('monthly-10-1')
+            ->addPlan('monthly-10-2')
+            ->withCoupon('coupon-1')
+            ->create($this->getTestToken());
+
+        $subscription = $user->subscription('default');
+        $this->assertTrue($user->subscribed('default'));
+        $this->assertTrue($user->onPlan('monthly-10-1'));
+        $this->assertTrue($user->onPlan('monthly-10-2'));
+        $this->assertFalse($user->onPlan('monthly-10-3'));
+        $this->assertTrue($subscription->active());
+        $this->assertFalse($subscription->cancelled());
+        $this->assertFalse($subscription->onGracePeriod());
+
+        // Invoice Tests
+        $invoice = $user->invoices()[0];
+
+        $this->assertTrue($invoice->hasDiscount());
+        $this->assertEquals('$15.00', $invoice->total());
+        $this->assertEquals('$5.00', $invoice->amountOff());
+        $this->assertFalse($invoice->discountIsPercentage());
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
     }
 
     public function test_generic_trials()
@@ -258,6 +361,9 @@ class CashierTest extends PHPUnit_Framework_TestCase
         $this->assertFalse($subscription->recurring());
         $this->assertFalse($subscription->ended());
         $this->assertEquals(Carbon::today()->addDays(7)->day, $subscription->trial_ends_at->day);
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
     }
 
     public function test_creating_subscription_with_explicit_trial()
@@ -296,6 +402,9 @@ class CashierTest extends PHPUnit_Framework_TestCase
         $this->assertFalse($subscription->recurring());
         $this->assertFalse($subscription->ended());
         $this->assertEquals(Carbon::tomorrow()->hour(3)->minute(15), $subscription->trial_ends_at);
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
     }
 
     public function test_applying_coupons_to_existing_customers()
@@ -314,6 +423,33 @@ class CashierTest extends PHPUnit_Framework_TestCase
         $customer = $user->asStripeCustomer();
 
         $this->assertEquals('coupon-1', $customer->discount->coupon->id);
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
+    }
+
+    public function testApplyingCouponsToExistingCustomers()
+    {
+        $user = User::create([
+            'email' => 'taylor@laravel.com',
+            'name' => 'Taylor Otwell',
+        ]);
+
+        // Create MultiSubscription
+        $multisubscription = $user
+            ->newMultisubscription()
+            ->addPlan('monthly-10-1')
+            ->addPlan('monthly-10-2')
+            ->create($this->getTestToken());
+
+        $user->applyCoupon('coupon-1');
+
+        $customer = $user->asStripeCustomer();
+
+        $this->assertEquals('coupon-1', $customer->discount->coupon->id);
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
     }
 
     /**
@@ -348,6 +484,9 @@ class CashierTest extends PHPUnit_Framework_TestCase
         $subscription = $user->subscription('main');
 
         $this->assertTrue($subscription->cancelled());
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
     }
 
     public function testCreatingOneOffInvoices()
@@ -365,6 +504,9 @@ class CashierTest extends PHPUnit_Framework_TestCase
         $invoice = $user->invoices()[0];
         $this->assertEquals('$10.00', $invoice->total());
         $this->assertEquals('Laravel Cashier', $invoice->invoiceItems()[0]->asStripeInvoiceItem()->description);
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
     }
 
     public function testRefunds()
@@ -383,6 +525,9 @@ class CashierTest extends PHPUnit_Framework_TestCase
 
         // Refund Tests
         $this->assertEquals(1000, $refund->amount);
+
+        $cu = \Stripe\Customer::retrieve($user->stripe_id);
+        $cu->delete();
     }
 
     protected function getTestToken()
